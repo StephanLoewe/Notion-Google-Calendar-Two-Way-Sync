@@ -1,7 +1,16 @@
 /**
  * Notion <-> Google Calendar two-way sync
  * ---------------------------------------
+ * Based on YA-GCal-Notion-Sync-Script by hk21702
+ * https://github.com/hk21702/YA-GCal-Notion-Sync-Script
+ *
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the Free
+ * Software Foundation, either version 3 of the License, or (at your option)
+ * any later version. See the LICENSE file for the full text.
+ *
  * Reliability-hardened version, revision 3 (2026-08-03).
+ * See README.md for the full list of changes against the original.
  *
  * Revision 3: multiple Notion databases. Each database ("sync target") owns a
  * set of calendars. A database may own any number of calendars; a calendar
