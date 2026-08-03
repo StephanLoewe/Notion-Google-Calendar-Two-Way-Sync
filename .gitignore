@@ -1,0 +1,9 @@
+# Real calendar IDs stay local - see calendars.example.gs
+calendars.gs
+
+# Local backups
+*.original-backup
+
+.DS_Store
+.clasp.json
+node_modules/
