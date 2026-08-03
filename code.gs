@@ -1,24 +1,32 @@
 /**
  * Notion <-> Google Calendar two-way sync
  * ---------------------------------------
- * Reliability-hardened version, revision 2 (2026-08-02).
+ * Reliability-hardened version, revision 3 (2026-08-03).
  *
- * Revision 2 adds, on top of revision 1:
- *   - occurrences of recurring series (recurringEventId) are skipped
- *   - hard sanity window for event dates (EVENT_WINDOW_PAST/FUTURE_DAYS)
+ * Revision 3: multiple Notion databases. Each database ("sync target") owns a
+ * set of calendars. A database may own any number of calendars; a calendar
+ * belongs to exactly one database, otherwise a new event would have no
+ * deterministic home. That rule is enforced at startup.
+ *
+ * Revision 2 added: occurrences of recurring series are skipped, and a hard
+ * sanity window for event dates.
  *
  * Setup:
  *   - enable the advanced "Calendar" service (Services -> Calendar API)
- *   - script properties: NOTION_TOKEN, DATABASE_ID
- *   - CALENDAR_IDS stays in its own file - do NOT declare it here as well,
- *     a duplicate `const` breaks the whole project
+ *   - script property: NOTION_TOKEN
+ *   - SYNC_TARGETS lives in targets.gs - do NOT declare it here as well,
+ *     a duplicate `const` breaks the whole Apps Script project
  *   - time-based trigger runs main()
  *
- * After installing: run resetSyncTokens() once, then fullSync() once, by hand.
+ * Legacy setups that still define CALENDAR_IDS plus a DATABASE_ID script
+ * property keep working; they are treated as a single sync target.
+ *
+ * After installing: run showConfiguration() to check targets.gs, then
+ * resetSyncTokens() once, then fullSync() once, by hand.
  */
 
 // ---------------------------------------------------------------------------
-// Notion property names
+// Notion property names (identical across all databases)
 // ---------------------------------------------------------------------------
 const NAME_NOTION = 'Name';
 const DATE_NOTION = 'Do Date';
@@ -61,7 +69,7 @@ const MAX_RUNTIME_MS = 4 * 60 * 1000; // stop gracefully before the 6 min Apps S
 const LOCK_WAIT_MS = 30 * 1000; // wait this long for a concurrent run to finish
 const MAX_RETRIES = 4; // retries for transient API failures
 const RETRY_BASE_DELAY_MS = 800;
-const MAX_GCAL_WRITES_PER_RUN = 60; // safety net: never let one run push unbounded work
+const MAX_GCAL_WRITES_PER_RUN = 60; // safety net across ALL targets combined
 const ERROR_BODY_LIMIT = 400; // keep failure mails readable (Notion returns full HTML pages)
 const NOTION_BATCH_SIZE = 10; // parallel Notion writes per fetchAll call (rate limit ~3 req/s)
 const NOTION_BATCH_PAUSE_MS = 400;
@@ -70,9 +78,10 @@ const NOTION_TEXT_LIMIT = 2000; // Notion rich_text / title limit per element
 const EVENT_LOOKUP_CHUNK = 20; // event ids per batched Notion lookup
 
 var NOTION_TOKEN;
-var DATABASE_ID;
+var TARGETS = []; // resolved sync targets, see resolveSyncTargets()
 
 let RUN_DEADLINE = 0;
+let GCAL_WRITES_THIS_RUN = 0;
 const CALENDAR_CACHE = {};
 
 // ---------------------------------------------------------------------------
@@ -92,24 +101,33 @@ function main() {
 
     try {
         startRunClock();
-        parseNotionProperties();
-        cleanupLegacySyncToken();
+        resolveSyncTargets();
+        pruneSyncTokens();
 
         if (DELETE_CANCELLED_EVENTS) {
-            try {
-                deleteCancelledEvents();
-            } catch (e) {
-                errors.push('deleteCancelledEvents: ' + errorText(e));
-                console.error('[-GCal] deleteCancelledEvents failed: %s', errorText(e));
+            for (const target of TARGETS) {
+                if (outOfTime()) break;
+                try {
+                    deleteCancelledEvents(target);
+                } catch (e) {
+                    errors.push('deleteCancelledEvents(' + target.name + '): ' + errorText(e));
+                    console.error('[-GCal] [%s] deleteCancelledEvents failed: %s', target.name, errorText(e));
+                }
             }
         }
 
+        // Event ids are globally unique in Google Calendar, so one set across
+        // all targets is enough to protect freshly pushed events.
         let recentlyModifiedEventIds = new Set();
-        try {
-            recentlyModifiedEventIds = syncToGCal();
-        } catch (e) {
-            errors.push('syncToGCal: ' + errorText(e));
-            console.error('[+GC] syncToGCal failed: %s', errorText(e));
+
+        for (const target of TARGETS) {
+            if (outOfTime()) break;
+            try {
+                syncTargetToGCal(target, recentlyModifiedEventIds);
+            } catch (e) {
+                errors.push('syncToGCal(' + target.name + '): ' + errorText(e));
+                console.error('[+GC] [%s] syncToGCal failed: %s', target.name, errorText(e));
+            }
         }
 
         if (!IGNORE_RECENTLY_PUSHED) {
@@ -118,17 +136,19 @@ function main() {
             console.log('[SYNC] Ignoring %d recently modified events to prevent overwrites', recentlyModifiedEventIds.size);
         }
 
-        for (const c_name of Object.keys(CALENDAR_IDS)) {
-            if (outOfTime()) {
-                console.log('[SYNC] Time budget reached. Stopping before calendar "%s". It will be picked up next run.', c_name);
-                break;
-            }
-            try {
-                syncFromGCal(c_name, false, recentlyModifiedEventIds);
-            } catch (e) {
-                // One broken calendar must not stop the others.
-                errors.push('syncFromGCal(' + c_name + '): ' + errorText(e));
-                console.error('[+ND] Sync from calendar "%s" failed: %s', c_name, errorText(e));
+        for (const target of TARGETS) {
+            for (const c_name of target.calendar_names) {
+                if (outOfTime()) {
+                    console.log('[SYNC] Time budget reached. Stopping before "%s / %s". It will be picked up next run.', target.name, c_name);
+                    break;
+                }
+                try {
+                    syncFromGCal(target, c_name, false, recentlyModifiedEventIds);
+                } catch (e) {
+                    // One broken calendar must not stop the others.
+                    errors.push('syncFromGCal(' + target.name + '/' + c_name + '): ' + errorText(e));
+                    console.error('[+ND] [%s] Sync from calendar "%s" failed: %s', target.name, c_name, errorText(e));
+                }
             }
         }
     } finally {
@@ -143,8 +163,8 @@ function main() {
 }
 
 /**
- * Syncs all calendars from Google Calendar to Notion using a full sync.
- * Discards all page tokens and resets the time window around "now".
+ * Syncs every calendar of every target from Google Calendar to Notion using a
+ * full sync. Discards all sync tokens and resets the time window around "now".
  */
 function fullSync() {
     const lock = LockService.getScriptLock();
@@ -155,20 +175,22 @@ function fullSync() {
 
     try {
         startRunClock();
-        parseNotionProperties();
-        cleanupLegacySyncToken();
+        resolveSyncTargets();
+        pruneSyncTokens();
 
         console.log('Performing full sync. Sync tokens, time min and time max will be reset.');
 
-        for (const c_name of Object.keys(CALENDAR_IDS)) {
-            if (outOfTime()) {
-                console.log('[SYNC] Time budget reached. Stopping before calendar "%s".', c_name);
-                break;
-            }
-            try {
-                syncFromGCal(c_name, true, new Set());
-            } catch (e) {
-                console.error('[+ND] Full sync for calendar "%s" failed: %s', c_name, errorText(e));
+        for (const target of TARGETS) {
+            for (const c_name of target.calendar_names) {
+                if (outOfTime()) {
+                    console.log('[SYNC] Time budget reached. Stopping before "%s / %s".', target.name, c_name);
+                    return;
+                }
+                try {
+                    syncFromGCal(target, c_name, true, new Set());
+                } catch (e) {
+                    console.error('[+ND] [%s] Full sync for calendar "%s" failed: %s', target.name, c_name, errorText(e));
+                }
             }
         }
     } finally {
@@ -179,11 +201,164 @@ function fullSync() {
 /** Utility: forget every stored sync token (next run does a full sync). */
 function resetSyncTokens() {
     const properties = PropertiesService.getUserProperties();
-    properties.deleteProperty('syncToken');
-    for (const c_name of Object.keys(CALENDAR_IDS)) {
-        properties.deleteProperty(syncTokenKey(c_name));
+    const all = properties.getProperties();
+    let removed = 0;
+
+    for (const key of Object.keys(all)) {
+        if (key.indexOf('syncToken') !== 0) continue;
+        properties.deleteProperty(key);
+        removed++;
     }
-    console.log('All sync tokens cleared.');
+
+    console.log('Cleared %d sync token(s).', removed);
+}
+
+/** Utility: print the resolved configuration. Run by hand to check targets.gs. */
+function showConfiguration() {
+    resolveSyncTargets();
+
+    let calendars = 0;
+    for (const target of TARGETS) {
+        console.log('Target "%s" -> database %s', target.name, target.database_id);
+        for (const c_name of target.calendar_names) {
+            console.log('    %s -> %s', c_name, target.calendars[c_name]);
+            calendars++;
+        }
+    }
+    console.log('%d target(s), %d calendar(s) in total.', TARGETS.length, calendars);
+}
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+/**
+ * Reads NOTION_TOKEN and normalises the sync targets into TARGETS.
+ * Throws with an actionable message on any configuration problem.
+ */
+function resolveSyncTargets() {
+    const properties = PropertiesService.getScriptProperties();
+
+    NOTION_TOKEN = properties.getProperty('NOTION_TOKEN');
+    if (!NOTION_TOKEN) throw new Error('Script property "NOTION_TOKEN" is not set.');
+
+    let raw_targets;
+
+    if (typeof SYNC_TARGETS !== 'undefined' && SYNC_TARGETS && SYNC_TARGETS.length > 0) {
+        raw_targets = SYNC_TARGETS;
+    } else if (typeof CALENDAR_IDS !== 'undefined' && CALENDAR_IDS) {
+        // Legacy single-database setup from before revision 3.
+        const legacy_database = properties.getProperty('DATABASE_ID');
+        if (!legacy_database) {
+            throw new Error('No SYNC_TARGETS configured and script property "DATABASE_ID" is not set. See targets.example.gs.');
+        }
+        console.log('[CFG] Using legacy single-database configuration (CALENDAR_IDS + DATABASE_ID).');
+        raw_targets = [{ name: 'Default', database_id: legacy_database, calendars: CALENDAR_IDS }];
+    } else {
+        throw new Error('No calendar configuration found. Define SYNC_TARGETS in targets.gs - see targets.example.gs.');
+    }
+
+    const resolved = [];
+    const calendar_owner = {}; // calendar id -> target name
+    const used_names = {};
+
+    for (let i = 0; i < raw_targets.length; i++) {
+        const raw = raw_targets[i] || {};
+        const name = raw.name || 'Target ' + (i + 1);
+
+        if (used_names[name]) {
+            throw new Error('Two sync targets are both named "' + name + '". Target names must be unique.');
+        }
+        used_names[name] = true;
+
+        const database_id = extractDatabaseId(raw.database_id);
+        if (!database_id) {
+            throw new Error('Sync target "' + name + '" has no usable database_id ("' + raw.database_id + '"). Use the database URL or the 32 character id.');
+        }
+
+        const calendars = raw.calendars || {};
+        const calendar_names = Object.keys(calendars);
+
+        if (calendar_names.length === 0) {
+            console.log('[CFG] Sync target "%s" has no calendars configured. Skipping it.', name);
+            continue;
+        }
+
+        for (const c_name of calendar_names) {
+            const calendar_id = calendars[c_name];
+
+            if (!calendar_id) {
+                throw new Error('Calendar "' + c_name + '" in sync target "' + name + '" has an empty calendar id.');
+            }
+
+            // A calendar may only belong to one database - otherwise a new
+            // event has no deterministic home. Several calendars per database
+            // are of course fine.
+            if (calendar_owner[calendar_id]) {
+                throw new Error('Calendar ' + calendar_id + ' is configured in both "' + calendar_owner[calendar_id] + '" and "' + name + '". Each calendar must belong to exactly one sync target.');
+            }
+            calendar_owner[calendar_id] = name;
+        }
+
+        resolved.push({
+            name: name,
+            database_id: database_id,
+            calendars: calendars,
+            calendar_names: calendar_names,
+        });
+    }
+
+    if (resolved.length === 0) {
+        throw new Error('No usable sync target found. Check targets.gs.');
+    }
+
+    TARGETS = resolved;
+    return resolved;
+}
+
+/** Accepts a full Notion URL or a raw id, with or without dashes. */
+function extractDatabaseId(raw) {
+    if (!raw) return null;
+    const trimmed = String(raw).trim().split('?')[0].split('#')[0];
+
+    const dashed = trimmed.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+    if (dashed) return dashed[0];
+
+    const plain = trimmed.match(/[0-9a-f]{32}/gi);
+    return plain ? plain[plain.length - 1] : null;
+}
+
+/**
+ * Sync tokens are keyed by calendar id, which survives renaming a calendar key
+ * or a target.
+ */
+function syncTokenKey(calendar_id) {
+    return 'syncToken::' + calendar_id;
+}
+
+/**
+ * Drop tokens for calendars that are no longer configured, so user properties
+ * cannot grow without bound. Also clears the legacy shared 'syncToken' and the
+ * revision 2 'syncToken::<calendar name>' keys.
+ */
+function pruneSyncTokens() {
+    const properties = PropertiesService.getUserProperties();
+    const all = properties.getProperties();
+
+    const valid = {};
+    for (const target of TARGETS) {
+        for (const c_name of target.calendar_names) {
+            valid[syncTokenKey(target.calendars[c_name])] = true;
+        }
+    }
+
+    for (const key of Object.keys(all)) {
+        if (key.indexOf('syncToken') !== 0) continue;
+        if (valid[key]) continue;
+
+        properties.deleteProperty(key);
+        console.log('[CFG] Removed obsolete sync token "%s".', key);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -192,6 +367,7 @@ function resetSyncTokens() {
 
 function startRunClock() {
     RUN_DEADLINE = Date.now() + MAX_RUNTIME_MS;
+    GCAL_WRITES_THIS_RUN = 0;
 }
 
 function outOfTime() {
@@ -232,15 +408,17 @@ function withRetry(label, fn) {
 // ---------------------------------------------------------------------------
 
 /**
- * Sync to Google Calendar from Notion
- * @returns {Set<String>} Event IDs that were modified through creation or update
+ * Push recently edited pages of one target to Google Calendar.
+ * @param {Object} target Resolved sync target
+ * @param {Set<String>} modified_eIds Collects event ids touched by this run
  */
-function syncToGCal() {
-    console.log('[+GC] Syncing to Google Calendar.');
+function syncTargetToGCal(target, modified_eIds) {
+    console.log('[+GC] [%s] Syncing to Google Calendar.', target.name);
 
     // Sorted by last edit, so everything that could need a push is at the top.
     // Two pages (200 entries) is plenty and keeps the run cheap.
     const results = queryNotionDatabase(
+        target,
         {
             sorts: [{ timestamp: 'last_edited_time', direction: 'descending' }],
             filter: {
@@ -252,34 +430,31 @@ function syncToGCal() {
         true
     );
 
-    const modified_eIds = new Set();
-    let writes = 0;
-
     for (const result of results) {
         if (outOfTime()) {
-            console.log('[+GC] Time budget reached. Remaining pages will be handled next run.');
+            console.log('[+GC] [%s] Time budget reached. Remaining pages will be handled next run.', target.name);
             break;
         }
-        if (writes >= MAX_GCAL_WRITES_PER_RUN) {
-            console.log('[+GC] Reached the per-run write limit (%d). Remaining pages will be handled next run.', MAX_GCAL_WRITES_PER_RUN);
+        if (GCAL_WRITES_THIS_RUN >= MAX_GCAL_WRITES_PER_RUN) {
+            console.log('[+GC] [%s] Reached the per-run write limit (%d). Remaining pages will be handled next run.', target.name, MAX_GCAL_WRITES_PER_RUN);
             break;
         }
 
         if (!isPageUpdatedRecently(result)) continue;
-        writes++;
+        GCAL_WRITES_THIS_RUN++;
 
         const event = convertToGCalEvent(result);
         if (!event) {
-            console.log('[+GC] Skipping page %s: not in the correct format or missing required information.', result.id);
+            console.log('[+GC] [%s] Skipping page %s: not in the correct format or missing required information.', target.name, result.id);
             continue;
         }
 
         const calendar_id = getSelectName(result, CALENDAR_ID_NOTION);
         const calendar_name = getSelectName(result, CALENDAR_NAME_NOTION);
-        const target_calendar_id = calendar_name ? CALENDAR_IDS[calendar_name] : null;
+        const target_calendar_id = calendar_name ? target.calendars[calendar_name] : null;
 
         if (!target_calendar_id) {
-            console.log('[+GC] Calendar name "%s" not found in CALENDAR_IDS. Skipping page %s.', calendar_name, result.id);
+            console.log('[+GC] [%s] Calendar "%s" is not configured for this target. Skipping page %s.', target.name, calendar_name, result.id);
             continue;
         }
 
@@ -289,52 +464,50 @@ function syncToGCal() {
                 const status = pushEventUpdate(event, event.id, calendar_id);
 
                 if (status === 'OK') {
-                    console.log('[+GC] Updated event %s in %s.', event.id, calendar_name);
+                    console.log('[+GC] [%s] Updated event %s in %s.', target.name, event.id, calendar_name);
                     // IMPORTANT: stamp Last Sync, otherwise this page looks
                     // "recently edited" forever and gets re-pushed every run.
-                    pushDatabaseUpdate(getBaseNotionProperties(event.id, calendar_name), result.id);
+                    pushDatabaseUpdate(getBaseNotionProperties(target, event.id, calendar_name), result.id);
                     modified_eIds.add(event.id);
                 } else if (status === 'NOT_FOUND') {
-                    console.log('[+GC] Event %s no longer exists in %s. Recreating.', event.id, calendar_name);
-                    const recreated_id = createEvent(result, event, calendar_name);
+                    console.log('[+GC] [%s] Event %s no longer exists in %s. Recreating.', target.name, event.id, calendar_name);
+                    const recreated_id = createEvent(target, result, event, calendar_name);
                     if (recreated_id) modified_eIds.add(recreated_id);
                 } else {
-                    console.log('[+GC] Failed to update event %s in %s.', event.id, calendar_name);
+                    console.log('[+GC] [%s] Failed to update event %s in %s.', target.name, event.id, calendar_name);
                 }
                 continue;
             }
 
             // Moving to a different calendar: create first, delete afterwards,
             // so a failed create can never lose the event.
-            const moved_id = createEvent(result, event, calendar_name);
+            const moved_id = createEvent(target, result, event, calendar_name);
             if (moved_id) {
                 deleteEvent(event.id, calendar_id);
-                console.log('[+GC] Event %s moved to %s (new id %s).', event.id, calendar_name, moved_id);
+                console.log('[+GC] [%s] Event %s moved to %s (new id %s).', target.name, event.id, calendar_name, moved_id);
                 modified_eIds.add(moved_id);
             } else {
-                console.log('[+GC] Event %s failed to move to %s. Original kept.', event.id, calendar_name);
+                console.log('[+GC] [%s] Event %s failed to move to %s. Original kept.', target.name, event.id, calendar_name);
             }
             continue;
         }
 
         // New event
-        const created_id = createEvent(result, event, calendar_name);
+        const created_id = createEvent(target, result, event, calendar_name);
         if (created_id) {
-            console.log('[+GC] Event created in %s.', calendar_name);
+            console.log('[+GC] [%s] Event created in %s.', target.name, calendar_name);
             modified_eIds.add(created_id);
         }
     }
-
-    return modified_eIds;
 }
 
-/** Delete events marked as cancelled in Notion from Google Calendar */
-function deleteCancelledEvents() {
-    console.log('[-GCal] Deleting cancel-tagged events from GCal');
+/** Delete events marked as cancelled in one Notion database from Google Calendar */
+function deleteCancelledEvents(target) {
+    console.log('[-GCal] [%s] Deleting cancel-tagged events from GCal', target.name);
 
     // Note: two conditions on the same multi_select property must be separate
     // filter objects - Notion only honours one operator per filter object.
-    const results = queryNotionDatabase({
+    const results = queryNotionDatabase(target, {
         filter: {
             and: [
                 { property: TAGS_NOTION, multi_select: { contains: CANCELLED_TAG_NAME } },
@@ -345,7 +518,7 @@ function deleteCancelledEvents() {
 
     for (const result of results) {
         if (outOfTime()) {
-            console.log('[-GCal] Time budget reached. Remaining cancellations will be handled next run.');
+            console.log('[-GCal] [%s] Time budget reached. Remaining cancellations will be handled next run.', target.name);
             break;
         }
         if (!isPageUpdatedRecently(result)) continue;
@@ -357,7 +530,7 @@ function deleteCancelledEvents() {
         if (event_id && calendar_id) {
             deleteEvent(event_id, calendar_id);
         } else {
-            console.log('[-GCal] Page %s is missing Event ID or Calendar ID. Archiving only.', result.id);
+            console.log('[-GCal] [%s] Page %s is missing Event ID or Calendar ID. Archiving only.', target.name, result.id);
         }
 
         if (ARCHIVE_CANCELLED_EVENTS) {
@@ -370,44 +543,32 @@ function deleteCancelledEvents() {
 // Google Calendar -> Notion
 // ---------------------------------------------------------------------------
 
-function syncTokenKey(c_name) {
-    return 'syncToken::' + c_name;
-}
-
-/** Removes the old shared sync token from previous script versions. */
-function cleanupLegacySyncToken() {
-    const properties = PropertiesService.getUserProperties();
-    if (properties.getProperty('syncToken')) {
-        console.log('[+ND] Removing legacy shared sync token (tokens are per calendar now).');
-        properties.deleteProperty('syncToken');
-    }
-}
-
 /**
- * Syncs from Google Calendar to Notion.
- * @param {String} c_name Calendar name (key of CALENDAR_IDS)
+ * Syncs one calendar of one target from Google Calendar to Notion.
+ * @param {Object} target Resolved sync target
+ * @param {String} c_name Calendar name (key inside target.calendars)
  * @param {Boolean} forceFullSync Whether to discard the stored sync token
  * @param {Set<String>} ignored_eIds Event IDs to not act on
  */
-function syncFromGCal(c_name, forceFullSync, ignored_eIds) {
-    const calendar_id = CALENDAR_IDS[c_name];
+function syncFromGCal(target, c_name, forceFullSync, ignored_eIds) {
+    const calendar_id = target.calendars[c_name];
     if (!calendar_id) {
-        console.log('[+ND] Unknown calendar name "%s". Skipping.', c_name);
+        console.log('[+ND] [%s] Unknown calendar name "%s". Skipping.', target.name, c_name);
         return;
     }
 
-    console.log('[+ND] Syncing from Google Calendar: %s', c_name);
+    console.log('[+ND] [%s] Syncing from Google Calendar: %s', target.name, c_name);
 
     const properties = PropertiesService.getUserProperties();
-    const tokenKey = syncTokenKey(c_name);
+    const tokenKey = syncTokenKey(calendar_id);
     let useFullSync = forceFullSync || !properties.getProperty(tokenKey);
 
     // At most one automatic fallback from incremental to full sync.
     for (let attempt = 0; attempt < 2; attempt++) {
-        const outcome = runCalendarSync(c_name, calendar_id, useFullSync, ignored_eIds, properties, tokenKey);
+        const outcome = runCalendarSync(target, c_name, calendar_id, useFullSync, ignored_eIds, properties, tokenKey);
         if (outcome !== 'RETRY_FULL') return;
 
-        console.log('[+ND] Sync token for "%s" is no longer valid. Falling back to a full sync.', c_name);
+        console.log('[+ND] [%s] Sync token for "%s" is no longer valid. Falling back to a full sync.', target.name, c_name);
         properties.deleteProperty(tokenKey);
         useFullSync = true;
     }
@@ -417,7 +578,7 @@ function syncFromGCal(c_name, forceFullSync, ignored_eIds) {
  * One pass over a single calendar.
  * @returns {'OK'|'STOPPED'|'RETRY_FULL'}
  */
-function runCalendarSync(c_name, calendar_id, useFullSync, ignored_eIds, properties, tokenKey) {
+function runCalendarSync(target, c_name, calendar_id, useFullSync, ignored_eIds, properties, tokenKey) {
     const options = {
         maxResults: 100,
         singleEvents: false, // don't expand recurring events - we filter them out
@@ -436,7 +597,7 @@ function runCalendarSync(c_name, calendar_id, useFullSync, ignored_eIds, propert
 
     do {
         if (outOfTime()) {
-            console.log('[+ND] Time budget reached while syncing "%s". Sync token not advanced, will resume next run.', c_name);
+            console.log('[+ND] [%s] Time budget reached while syncing "%s". Sync token not advanced, will resume next run.', target.name, c_name);
             return 'STOPPED';
         }
 
@@ -454,10 +615,10 @@ function runCalendarSync(c_name, calendar_id, useFullSync, ignored_eIds, propert
 
         const items = events.items || [];
         if (items.length > 0) {
-            console.log('[+ND] Parsing %d changed event(s). %s', items.length, c_name);
-            parseEvents(items, c_name, ignored_eIds);
+            console.log('[+ND] [%s] Parsing %d changed event(s). %s', target.name, items.length, c_name);
+            parseEvents(target, items, c_name, ignored_eIds);
         } else {
-            console.log('[+ND] No changes. %s', c_name);
+            console.log('[+ND] [%s] No changes. %s', target.name, c_name);
         }
 
         pageToken = events.nextPageToken;
@@ -479,11 +640,12 @@ function isInvalidSyncTokenError(e) {
 
 /**
  * Determine if GCal events need to be updated, removed or added to the database
+ * @param {Object} target Resolved sync target that owns this calendar
  * @param {Object[]} items Google Calendar event resources
  * @param {String} c_name Calendar name
  * @param {Set<String>} ignored_eIds Event IDs to not act on
  */
-function parseEvents(items, c_name, ignored_eIds) {
+function parseEvents(target, items, c_name, ignored_eIds) {
     const candidates = [];
 
     for (const event of items) {
@@ -496,7 +658,7 @@ function parseEvents(items, c_name, ignored_eIds) {
 
         if (event.status === 'cancelled') {
             console.log('[+ND] Event %s was cancelled.', event.id);
-            handleEventCancelled(event);
+            handleEventCancelled(target, event);
             continue;
         }
 
@@ -535,7 +697,7 @@ function parseEvents(items, c_name, ignored_eIds) {
     if (candidates.length === 0) return;
 
     // One batched lookup instead of one query per event.
-    const existing_pages = getPagesForEvents(candidates.map(function (e) { return e.id; }));
+    const existing_pages = getPagesForEvents(target, candidates.map(function (e) { return e.id; }));
 
     const requests = [];
     for (const event of candidates) {
@@ -551,12 +713,12 @@ function parseEvents(items, c_name, ignored_eIds) {
             }
 
             console.log('[+ND] Event %s -> existing page %s. Updating.', event.id, page.id);
-            requests.push(updateDatabaseEntry(event, page.id, tags));
+            requests.push(updateDatabaseEntry(target, event, page.id, tags));
             continue;
         }
 
         try {
-            requests.push(createDatabaseEntry(event));
+            requests.push(createDatabaseEntry(target, event));
         } catch (err) {
             if (err instanceof InvalidEventError && SKIP_BAD_EVENTS) {
                 console.log('[+ND] Skipping creation of event %s due to invalid properties.', event.id);
@@ -643,13 +805,15 @@ function retryNotionWrites(requests) {
 // ---------------------------------------------------------------------------
 
 /**
- * Query the database with pagination.
+ * Query one target's database with pagination.
+ * @param {Object} target Resolved sync target
  * @param {Object} payload query body (filter / sorts)
  * @param {Number} maxPages safety cap
+ * @param {Boolean} quiet suppress the "hit the page cap" log
  * @returns {Object[]} page results
  */
-function queryNotionDatabase(payload, maxPages, quiet) {
-    const url = getDatabaseURL();
+function queryNotionDatabase(target, payload, maxPages, quiet) {
+    const url = getDatabaseURL(target.database_id);
     const limit = maxPages || NOTION_MAX_QUERY_PAGES;
 
     let results = [];
@@ -668,17 +832,16 @@ function queryNotionDatabase(payload, maxPages, quiet) {
     } while (cursor && pages < limit && !outOfTime());
 
     if (cursor && !quiet) {
-        console.log('[Notion] Query hit the %d page cap - some results were not processed this run.', limit);
+        console.log('[Notion] [%s] Query hit the %d page cap - some results were not processed this run.', target.name, limit);
     }
     return results;
 }
 
 /**
- * Look up Notion pages for many event ids at once.
- * @param {String[]} event_ids
+ * Look up Notion pages for many event ids at once, within one target.
  * @returns {Object} map of event id -> page
  */
-function getPagesForEvents(event_ids) {
+function getPagesForEvents(target, event_ids) {
     const map = {};
     const unique = Array.from(new Set(event_ids.filter(Boolean)));
 
@@ -686,7 +849,7 @@ function getPagesForEvents(event_ids) {
         if (outOfTime()) break;
 
         const chunk = unique.slice(i, i + EVENT_LOOKUP_CHUNK);
-        const results = queryNotionDatabase({
+        const results = queryNotionDatabase(target, {
             filter: {
                 or: chunk.map(function (id) {
                     return { property: EVENT_ID_NOTION, rich_text: { equals: id } };
@@ -699,7 +862,7 @@ function getPagesForEvents(event_ids) {
             const id = prop ? flattenRichText(prop.rich_text) : '';
             if (!id) continue;
             if (map[id]) {
-                console.log('[Notion] Multiple pages carry event id %s. Using the first one.', id);
+                console.log('[Notion] [%s] Multiple pages carry event id %s. Using the first one.', target.name, id);
                 continue;
             }
             map[id] = page;
@@ -710,31 +873,12 @@ function getPagesForEvents(event_ids) {
 }
 
 /**
- * Determine if a page exists for the event. Returns the page response if found.
- * @param {Object} event
- * @returns {Object|false}
+ * Get the Notion page ID of the corresponding GCal event within one target.
+ * @returns {String|null}
  */
-function getPageFromEvent(event) {
+function getPageId(target, event) {
     const results = queryNotionDatabase(
-        {
-            filter: { and: [{ property: EVENT_ID_NOTION, rich_text: { equals: event.id } }] },
-        },
-        1
-    );
-
-    if (results.length === 0) return false;
-    if (results.length > 1) {
-        console.log('Found multiple entries with event id %s. Only considering the first one.', event.id);
-    }
-    return results[0];
-}
-
-/**
- * Get the Notion page ID of the corresponding GCal event. Null if not found.
- * @param {Object} event
- */
-function getPageId(event) {
-    const results = queryNotionDatabase(
+        target,
         {
             filter: {
                 and: [
@@ -755,10 +899,6 @@ function getPageId(event) {
 
 /**
  * Interact with the Notion API. Retries transient failures.
- * @param {String} url
- * @param {Object} payload_dict
- * @param {String} method
- * @returns {Object} parsed response
  */
 function notionFetch(url, payload_dict, method) {
     const options = {
@@ -794,7 +934,7 @@ function notionError(code, response) {
 
     if (code === 401) message = 'Notion token is invalid (401). ' + body;
     else if (code === 403) message = 'Notion object is not shared with the integration (403). ' + body;
-    else if (code === 404) message = 'Notion object not found (404). ' + body;
+    else if (code === 404) message = 'Notion object not found (404) - is the database shared with the integration? ' + body;
     else message = 'Notion API error ' + code + ': ' + body;
 
     const e = new Error(message);
@@ -833,30 +973,27 @@ function getNotionHeaders() {
     };
 }
 
-function getDatabaseURL() {
-    return 'https://api.notion.com/v1/databases/' + DATABASE_ID + '/query';
-}
-
-function getNotionParent() {
-    return { database_id: DATABASE_ID };
+function getDatabaseURL(database_id) {
+    return 'https://api.notion.com/v1/databases/' + database_id + '/query';
 }
 
 /**
  * Update database entry with new event information
  * @returns {*} request object if multi is true, fetch response otherwise
  */
-function updateDatabaseEntry(event, page_id, existing_tags, multi) {
+function updateDatabaseEntry(target, event, page_id, existing_tags, multi) {
     if (existing_tags === undefined) existing_tags = [];
     if (multi === undefined) multi = true;
 
-    const properties = convertToNotionProperty(event, existing_tags);
+    const properties = convertToNotionProperty(target, event, existing_tags);
     const archive = ARCHIVE_CANCELLED_EVENTS && event.status === 'cancelled';
 
     return pushDatabaseUpdate(properties, page_id, archive, multi);
 }
 
 /**
- * Push an update to a Notion page.
+ * Push an update to a Notion page. Page ids are globally unique, so this needs
+ * no target context.
  * @returns {*} request object if multi, otherwise the URL fetch response (or null on failure)
  */
 function pushDatabaseUpdate(properties, page_id, archive, multi) {
@@ -894,13 +1031,13 @@ function pushDatabaseUpdate(properties, page_id, archive, multi) {
 }
 
 /**
- * Create a new database entry for the event
+ * Create a new database entry for the event in the given target
  * @returns {Object} fetchAll request object
  */
-function createDatabaseEntry(event) {
+function createDatabaseEntry(target, event) {
     const payload = {
-        parent: { type: 'database_id', database_id: DATABASE_ID },
-        properties: convertToNotionProperty(event),
+        parent: { type: 'database_id', database_id: target.database_id },
+        properties: convertToNotionProperty(target, event),
     };
 
     if (!checkNotionProperty(payload.properties)) {
@@ -989,8 +1126,8 @@ function hasTag(tags, tag_name) {
 /**
  * Return a Notion JSON property object based on event data
  */
-function convertToNotionProperty(event, existing_tags) {
-    const properties = getBaseNotionProperties(event.id, event.c_name);
+function convertToNotionProperty(target, event, existing_tags) {
+    const properties = getBaseNotionProperties(target, event.id, event.c_name);
 
     properties[DESCRIPTION_NOTION] = {
         type: 'rich_text',
@@ -1049,7 +1186,7 @@ function shiftDateString(date_string, days) {
 /**
  * Return base Notion property object including generation time
  */
-function getBaseNotionProperties(event_id, calendar_name) {
+function getBaseNotionProperties(target, event_id, calendar_name) {
     const properties = {
         [LAST_SYNC_NOTION]: {
             type: 'date',
@@ -1061,7 +1198,7 @@ function getBaseNotionProperties(event_id, calendar_name) {
         },
     };
 
-    const calendar_id = calendar_name ? CALENDAR_IDS[calendar_name] : null;
+    const calendar_id = calendar_name ? target.calendars[calendar_name] : null;
     // Never write undefined into a select - Notion rejects the whole request.
     if (calendar_id) properties[CALENDAR_ID_NOTION] = { select: { name: calendar_id } };
     if (calendar_name) properties[CALENDAR_NAME_NOTION] = { select: { name: calendar_name } };
@@ -1152,35 +1289,6 @@ function flattenRichText(rich_text_result) {
     return plain_text;
 }
 
-/**
- * Parses Notion configuration from script properties into globals.
- */
-function parseNotionProperties() {
-    const properties = PropertiesService.getScriptProperties();
-
-    NOTION_TOKEN = properties.getProperty('NOTION_TOKEN');
-    if (!NOTION_TOKEN) throw new Error('Script property "NOTION_TOKEN" is not set.');
-
-    const raw_database = properties.getProperty('DATABASE_ID');
-    if (!raw_database) throw new Error('Script property "DATABASE_ID" is not set.');
-
-    DATABASE_ID = extractDatabaseId(raw_database);
-    if (!DATABASE_ID) {
-        throw new Error('Could not extract a Notion database id from "' + raw_database + '". Use the database URL or the 32 character id.');
-    }
-}
-
-/** Accepts a full Notion URL or a raw id, with or without dashes. */
-function extractDatabaseId(raw) {
-    const trimmed = String(raw).trim().split('?')[0].split('#')[0];
-
-    const dashed = trimmed.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
-    if (dashed) return dashed[0];
-
-    const plain = trimmed.match(/[0-9a-f]{32}/gi);
-    return plain ? plain[plain.length - 1] : null;
-}
-
 function getRelativeDate(daysOffset, hour) {
     const date = new Date();
     date.setDate(date.getDate() + daysOffset);
@@ -1199,13 +1307,13 @@ function isPageUpdatedRecently(page_result) {
 }
 
 /** Deals with an event cancelled on the GCal side */
-function handleEventCancelled(event) {
-    const page_id = getPageId(event);
+function handleEventCancelled(target, event) {
+    const page_id = getPageId(target, event);
 
     if (page_id) {
-        updateDatabaseEntry(event, page_id, [], false);
+        updateDatabaseEntry(target, event, page_id, [], false);
     } else {
-        console.log('Event %s not found in Notion database. Skipping.', event.id);
+        console.log('Event %s not found in database "%s". Skipping.', event.id, target.name);
     }
 }
 
@@ -1237,8 +1345,8 @@ function getCalendar(calendar_id) {
  * Create an event in Google Calendar.
  * @returns {String|false} the new event id, or false
  */
-function createEvent(page, event, calendar_name) {
-    const calendar_id = CALENDAR_IDS[calendar_name];
+function createEvent(target, page, event, calendar_name) {
+    const calendar_id = target.calendars[calendar_name];
     const calendar = getCalendar(calendar_id);
     if (!calendar) return false;
 
@@ -1283,7 +1391,7 @@ function createEvent(page, event, calendar_name) {
         return false;
     }
 
-    pushDatabaseUpdate(getBaseNotionProperties(new_event_id, calendar_name), page.id);
+    pushDatabaseUpdate(getBaseNotionProperties(target, new_event_id, calendar_name), page.id);
     return new_event_id;
 }
 
