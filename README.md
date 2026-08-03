@@ -12,6 +12,18 @@ for the full list.
 
 ---
 
+## Support
+
+If this saved you an afternoon of debugging, you can
+[buy me a coffee](https://buymeacoffee.com/stephanloewe). Entirely optional and
+in no way a condition of use — this is and stays free software under the GPL.
+
+Credit for the original groundwork goes to
+[hk21702](https://github.com/hk21702). Consider starring
+[their repository](https://github.com/hk21702/YA-GCal-Notion-Sync-Script) as well.
+
+---
+
 ## What it does
 
 - **Notion → Google Calendar.** Pages edited in Notion are pushed to the
