@@ -52,6 +52,26 @@ what was dropped and why.
 
 ---
 
+## Versions
+
+`main` always carries the current version. Two tags mark the versions you can
+pick between:
+
+| Tag | Configuration |
+| --- | --- |
+| [`v3-multi-database`](../../releases/tag/v3-multi-database) | `SYNC_TARGETS` in `targets.gs` — any number of databases |
+| [`v2-single-database`](../../releases/tag/v2-single-database) | `CALENDAR_IDS` in `calendars.gs` plus a `DATABASE_ID` script property — one database |
+
+**You probably want the current version even for a single database.** One entry
+in `SYNC_TARGETS` *is* a single-database setup, and it is where fixes land. `v2`
+exists as a rollback point, not as a parallel branch — it does not receive
+subsequent fixes.
+
+If you are already running the `v2` layout, it keeps working unchanged: when no
+`SYNC_TARGETS` is defined, `CALENDAR_IDS` and `DATABASE_ID` are read instead and
+treated as a single target. You can upgrade the code first and migrate the
+configuration later.
+
 ## Requirements
 
 - A Google account (Workspace or consumer) with Google Calendar
@@ -161,6 +181,8 @@ databases.
 | `showConfiguration()` | Prints the resolved targets and calendars. Run after editing `targets.gs` |
 | `fullSync()` | Ignores sync tokens and re-reads the whole time window |
 | `resetSyncTokens()` | Deletes all stored sync tokens, forcing a full sync on the next run |
+| `findRecurringLeftovers()` | Lists pages still pointing at an occurrence of a recurring series. Read-only |
+| `tagRecurringLeftovers()` | Tags what the above finds with `Ignore Sync`. **Modifies your database** |
 
 ---
 
@@ -221,6 +243,8 @@ logged with a reason.
 | `Calendar … is configured in both …` | The same calendar id appears in two sync targets. Each calendar belongs to exactly one |
 | `Another sync run is still in progress` | Normal under load. If it appears constantly, the trigger interval is shorter than the actual runtime |
 | Events not appearing in Notion | Check the log — recurring, all-day and out-of-window events are skipped by design |
+| An entry exists in Notion but not on a Notion Calendar view | Notion Calendar shows a database through one specific *view*. That view's filters apply — a view limited to open tasks hides everything already completed |
+| Old recurring meetings keep reappearing | Pages created before occurrences were filtered still hold an occurrence event id. Run `findRecurringLeftovers()` to list them |
 
 ---
 
