@@ -237,6 +237,83 @@ function showConfiguration() {
     console.log('%d target(s), %d calendar(s) in total.', TARGETS.length, calendars);
 }
 
+/**
+ * Utility: list Notion pages that still point at a single occurrence of a
+ * recurring series. Those are leftovers from before occurrences were filtered
+ * out - typically old Jour Fixes. Read-only, changes nothing.
+ *
+ * Run tagRecurringLeftovers() afterwards to actually tag what this finds.
+ */
+function findRecurringLeftovers() {
+    reportRecurringLeftovers(false);
+}
+
+/**
+ * Utility: tag every page found by findRecurringLeftovers() with the
+ * IGNORE_SYNC_TAG_NAME tag, so the sync leaves them alone from now on.
+ * Existing tags are kept. THIS MODIFIES YOUR DATABASE - run
+ * findRecurringLeftovers() first and read the list.
+ */
+function tagRecurringLeftovers() {
+    reportRecurringLeftovers(true);
+}
+
+function reportRecurringLeftovers(apply_tag) {
+    startRunClock();
+    resolveSyncTargets();
+
+    let total = 0;
+
+    for (const target of TARGETS) {
+        const results = queryNotionDatabase(
+            target,
+            { filter: { property: EVENT_ID_NOTION, rich_text: { is_not_empty: true } } },
+            20
+        );
+
+        const hits = [];
+        for (const page of results) {
+            const prop = page.properties ? page.properties[EVENT_ID_NOTION] : null;
+            const event_id = prop ? flattenRichText(prop.rich_text) : '';
+            if (!isRecurringOccurrenceId(event_id)) continue;
+
+            const title_prop = page.properties ? page.properties[NAME_NOTION] : null;
+            const title = title_prop ? flattenRichText(title_prop.title) : '(no title)';
+            const date_prop = page.properties ? page.properties[DATE_NOTION] : null;
+            const date = date_prop && date_prop.date ? date_prop.date.start : '(no date)';
+
+            hits.push({ page: page, event_id: event_id, title: title, date: date });
+        }
+
+        console.log('[SCAN] [%s] %d of %d page(s) point at a recurring occurrence.', target.name, hits.length, results.length);
+
+        for (const hit of hits) {
+            console.log('    %s  %s  (%s)', hit.date, hit.title, hit.event_id);
+
+            if (!apply_tag) continue;
+
+            const tags_prop = hit.page.properties[TAGS_NOTION];
+            const tags = tags_prop && tags_prop.multi_select ? tags_prop.multi_select.slice() : [];
+
+            if (hasTag(tags, IGNORE_SYNC_TAG_NAME)) continue;
+
+            tags.push({ name: IGNORE_SYNC_TAG_NAME });
+            pushDatabaseUpdate({ [TAGS_NOTION]: { multi_select: tags } }, hit.page.id);
+            console.log('        -> tagged "%s"', IGNORE_SYNC_TAG_NAME);
+        }
+
+        total += hits.length;
+    }
+
+    if (total === 0) {
+        console.log('[SCAN] No recurring leftovers found.');
+    } else if (!apply_tag) {
+        console.log('[SCAN] %d leftover(s) in total. Run tagRecurringLeftovers() to tag them "%s", or clean them up by hand.', total, IGNORE_SYNC_TAG_NAME);
+    } else {
+        console.log('[SCAN] %d leftover(s) processed.', total);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -479,6 +556,14 @@ function syncTargetToGCal(target, modified_eIds) {
                     pushDatabaseUpdate(getBaseNotionProperties(target, event.id, calendar_name), result.id);
                     modified_eIds.add(event.id);
                 } else if (status === 'NOT_FOUND') {
+                    // Never resurrect an occurrence of a recurring series. Such
+                    // pages are leftovers from before occurrences were filtered
+                    // out; recreating them turns a deleted Jour Fixe into a new
+                    // standalone event that nobody asked for.
+                    if (isRecurringOccurrenceId(event.id)) {
+                        console.log('[+GC] [%s] Page %s points at occurrence %s of a deleted recurring series. Not recreating - tag it "%s" or clear its Event ID. See findRecurringLeftovers().', target.name, result.id, event.id, IGNORE_SYNC_TAG_NAME);
+                        continue;
+                    }
                     console.log('[+GC] [%s] Event %s no longer exists in %s. Recreating.', target.name, event.id, calendar_name);
                     const recreated_id = createEvent(target, result, event, calendar_name);
                     if (recreated_id) modified_eIds.add(recreated_id);
@@ -1123,6 +1208,23 @@ function isEventWithinSaneWindow(event) {
     const day_ms = 24 * 60 * 60 * 1000;
 
     return start.getTime() >= now - EVENT_WINDOW_PAST_DAYS * day_ms && start.getTime() <= now + EVENT_WINDOW_FUTURE_DAYS * day_ms;
+}
+
+/**
+ * True if an event id names a single occurrence of a recurring series.
+ * Google builds those as "<base id>_<UTC timestamp>", e.g.
+ * "abc123_20260707T073000Z" for timed and "abc123_20260707" for all-day
+ * occurrences. The base id itself never carries that suffix.
+ *
+ * Pages holding such an id are leftovers from before occurrences were
+ * filtered out. They cannot be round-tripped: the series lives in Google
+ * Calendar, Notion has no recurrence model to represent it.
+ *
+ * @param {String} event_id
+ * @returns {Boolean}
+ */
+function isRecurringOccurrenceId(event_id) {
+    return /_\d{8}(T\d{6}Z)?$/.test(String(event_id || ''));
 }
 
 function hasTag(tags, tag_name) {
