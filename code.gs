@@ -10,6 +10,7 @@
  * any later version. See the LICENSE file for the full text.
  *
  * Reliability-hardened version, revision 3 (2026-08-03).
+ * Last edited: 2026-10-07 (idempotent event creation, findDuplicates()).
  * See README.md for the full list of changes against the original.
  *
  * Revision 3: multiple Notion databases. Each database ("sync target") owns a
