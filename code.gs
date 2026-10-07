@@ -314,6 +314,103 @@ function reportRecurringLeftovers(apply_tag) {
     }
 }
 
+/**
+ * Utility: report duplicates, read-only - changes nothing anywhere.
+ *
+ * Looks at both sides:
+ *   - Notion: live pages of one database sharing title and date
+ *   - Google Calendar: timed events of one calendar sharing title and start,
+ *     within the sanity window (EVENT_WINDOW_PAST_DAYS / FUTURE_DAYS)
+ *
+ * Each group lists the page ids / event ids involved and which of them a Notion
+ * page still points at ("referenced"). An event nobody references is an orphan
+ * and the one to delete. For duplicate Notion pages, tag all but one with
+ * "Cancel and Remove" - the next run deletes their event and archives them.
+ */
+function findDuplicates() {
+    startRunClock();
+    resolveSyncTargets();
+
+    const day_ms = 24 * 60 * 60 * 1000;
+    let groups_total = 0;
+
+    for (const target of TARGETS) {
+        const pages = queryNotionDatabase(target, {}, 20);
+        const referenced = {}; // event id -> page id
+        const by_key = {};
+
+        for (const page of pages) {
+            if (page.archived) continue;
+            const props = page.properties || {};
+
+            const tags = props[TAGS_NOTION] && props[TAGS_NOTION].multi_select ? props[TAGS_NOTION].multi_select : [];
+            if (hasTag(tags, IGNORE_SYNC_TAG_NAME)) continue;
+
+            const event_id = props[EVENT_ID_NOTION] ? flattenRichText(props[EVENT_ID_NOTION].rich_text) : '';
+            if (event_id) referenced[event_id] = page.id;
+
+            const title = props[NAME_NOTION] ? flattenRichText(props[NAME_NOTION].title) : '';
+            const date = props[DATE_NOTION] && props[DATE_NOTION].date ? props[DATE_NOTION].date : null;
+            if (!title || !date || !date.start) continue;
+
+            const key = title.trim().toLowerCase() + '|' + date.start + '|' + (date.end || '');
+            (by_key[key] = by_key[key] || []).push({ id: page.id, event_id: event_id, title: title, start: date.start, created: page.created_time });
+        }
+
+        const page_groups = Object.keys(by_key).map(function (k) { return by_key[k]; }).filter(function (g) { return g.length > 1; });
+        console.log('[DUP] [%s] %d Notion page(s) checked, %d duplicate group(s).', target.name, pages.length, page_groups.length);
+
+        for (const group of page_groups) {
+            group.sort(function (a, b) { return a.created < b.created ? -1 : 1; });
+            console.log('    NOTION  %s  "%s"', group[0].start, group[0].title);
+            for (const g of group) console.log('        page %s  created %s  event %s', g.id, g.created, g.event_id || '(none)');
+        }
+        groups_total += page_groups.length;
+
+        for (const c_name of target.calendar_names) {
+            if (outOfTime()) break;
+            const calendar_id = target.calendars[c_name];
+            const by_event = {};
+            let page_token = null;
+
+            do {
+                const list = withRetry('Calendar.Events.list(' + c_name + ')', function () {
+                    return Calendar.Events.list(calendar_id, {
+                        timeMin: new Date(Date.now() - EVENT_WINDOW_PAST_DAYS * day_ms).toISOString(),
+                        timeMax: new Date(Date.now() + EVENT_WINDOW_FUTURE_DAYS * day_ms).toISOString(),
+                        singleEvents: false,
+                        maxResults: 250,
+                        pageToken: page_token || undefined,
+                    });
+                });
+
+                for (const ev of list.items || []) {
+                    if (ev.status === 'cancelled' || ev.recurrence || ev.recurringEventId) continue;
+                    const start = ev.start ? ev.start.dateTime || ev.start.date : null;
+                    if (!start) continue;
+                    const key = String(ev.summary || '').trim().toLowerCase() + '|' + start;
+                    (by_event[key] = by_event[key] || []).push(ev);
+                }
+                page_token = list.nextPageToken;
+            } while (page_token && !outOfTime());
+
+            const event_groups = Object.keys(by_event).map(function (k) { return by_event[k]; }).filter(function (g) { return g.length > 1; });
+            console.log('[DUP] [%s] Calendar "%s": %d duplicate group(s).', target.name, c_name, event_groups.length);
+
+            for (const group of event_groups) {
+                const first = group[0];
+                console.log('    CALENDAR  %s  "%s"', first.start.dateTime || first.start.date, first.summary);
+                for (const ev of group) {
+                    console.log('        event %s  created %s  %s', ev.id, ev.created, referenced[ev.id] ? 'referenced by page ' + referenced[ev.id] : 'ORPHAN - no page points at it');
+                }
+            }
+            groups_total += event_groups.length;
+        }
+    }
+
+    console.log(groups_total === 0 ? '[DUP] No duplicates found.' : '[DUP] %d duplicate group(s) in total. Nothing was changed.', groups_total);
+}
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -795,7 +892,15 @@ function parseEvents(target, items, c_name, ignored_eIds) {
 
     const requests = [];
     for (const event of candidates) {
-        const page = existing_pages[event.id];
+        let page = existing_pages[event.id];
+
+        // An event whose id was derived from a Notion page id was created by this
+        // script, even if the page lost track of it (failed Event ID write).
+        // Re-attach it instead of creating a second page for the same task.
+        if (!page && isPageDerivedEventId(event.id)) {
+            page = getPageInTarget(target, event.id);
+            if (page) console.log('[+ND] [%s] Event %s belongs to existing page %s. Re-attaching.', target.name, event.id, page.id);
+        }
 
         if (page) {
             const tags_prop = page.properties ? page.properties[TAGS_NOTION] : null;
@@ -989,6 +1094,22 @@ function getPageId(target, event) {
         console.log('Found multiple entries with event id %s. Only processing the first one.', event.id);
     }
     return results[0].id;
+}
+
+/**
+ * Fetch a page by id, but only if it is live and lives in this target's database.
+ * @returns {Object|null}
+ */
+function getPageInTarget(target, page_id) {
+    try {
+        const page = notionFetch('https://api.notion.com/v1/pages/' + page_id, null, 'GET');
+        if (!page || page.archived) return null;
+        const parent = page.parent && page.parent.database_id ? String(page.parent.database_id).replace(/-/g, '') : '';
+        return parent.toLowerCase() === String(target.database_id).replace(/-/g, '').toLowerCase() ? page : null;
+    } catch (e) {
+        // 404 / 403: not a page of ours (or not shared) - treat as unknown.
+        return null;
+    }
 }
 
 /**
@@ -1453,57 +1574,120 @@ function getCalendar(calendar_id) {
 }
 
 /**
- * Create an event in Google Calendar.
- * @returns {String|false} the new event id, or false
+ * Deterministic Google Calendar event id for a Notion page: the page id without
+ * dashes. Google accepts client-chosen ids (base32hex: 0-9, a-v, 5+ chars), and
+ * a second insert with the same id in the same calendar is rejected with 409.
+ *
+ * That makes creating an event idempotent. However often a create is repeated -
+ * a failed Event ID write, a killed run, a second copy of this script running in
+ * another Google account - one page can only ever own one event per calendar.
+ * Before this, every repeat produced another copy.
+ *
+ * @param {String} page_id Notion page id (with or without dashes)
+ * @returns {String}
+ */
+function eventIdForPage(page_id) {
+    return String(page_id || '').replace(/-/g, '').toLowerCase();
+}
+
+/** True if an event id has the shape produced by eventIdForPage(). */
+function isPageDerivedEventId(event_id) {
+    return /^[0-9a-f]{32}$/.test(String(event_id || ''));
+}
+
+function isConflictError(e) {
+    const code = e && e.details && e.details.code;
+    return code === 409 || /already exists|identifier.*(in use|exists)|duplicate/i.test(String((e && e.message) || e || ''));
+}
+
+/** yyyy-MM-dd in the script's time zone, as the Calendar API expects for all-day dates. */
+function toCalendarDate(date) {
+    return Utilities.formatDate(date, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+}
+
+/**
+ * Builds a Calendar API event resource (start/end/text) from a converted Notion event.
+ * @returns {Object|null} null if the start date is invalid
+ */
+function buildEventResource(event, page_id) {
+    const start = event.start;
+    if (!(start instanceof Date) || isNaN(start.getTime())) return null;
+
+    let end = event.end instanceof Date && !isNaN(event.end.getTime()) ? event.end : null;
+
+    const resource = {
+        summary: event.summary || '(No title)',
+        description: event.description || '',
+        location: event.location || '',
+        extendedProperties: { private: { notionPageId: String(page_id || '') } },
+    };
+
+    if (event.all_day) {
+        // Notion end date is inclusive, GCal end date is exclusive.
+        const exclusive_end = new Date((end || start).getTime());
+        exclusive_end.setDate(exclusive_end.getDate() + 1);
+        resource.start = { date: toCalendarDate(start) };
+        resource.end = { date: toCalendarDate(exclusive_end) };
+    } else {
+        if (!end || end <= start) end = new Date(start.getTime() + 30 * 60 * 1000);
+        resource.start = { dateTime: start.toISOString() };
+        resource.end = { dateTime: end.toISOString() };
+    }
+
+    return resource;
+}
+
+/**
+ * Create an event in Google Calendar - at most once per page and calendar.
+ *
+ * The event id is derived from the Notion page id (see eventIdForPage). If that
+ * id is already taken, the event from an earlier attempt is adopted and brought
+ * up to date instead of creating a copy.
+ *
+ * @returns {String|false} the event id, or false
  */
 function createEvent(target, page, event, calendar_name) {
     const calendar_id = target.calendars[calendar_name];
-    const calendar = getCalendar(calendar_id);
-    if (!calendar) return false;
+    if (!calendar_id) return false;
 
-    const summary = event.summary || '(No title)';
-    const details = {
-        description: event.description || '',
-        location: event.location || '',
-    };
-
-    const start = event.start;
-    if (!(start instanceof Date) || isNaN(start.getTime())) {
+    const resource = buildEventResource(event, page.id);
+    if (!resource) {
         console.error('[+GC] Page %s has an invalid start date.', page.id);
         return false;
     }
 
-    let end = event.end instanceof Date && !isNaN(event.end.getTime()) ? event.end : null;
+    const event_id = eventIdForPage(page.id);
+    resource.id = event_id;
 
-    let new_event_id;
     try {
-        let new_event;
-        if (event.all_day) {
-            if (end) {
-                // Notion end date is inclusive, GCal end date is exclusive.
-                const shifted = new Date(end.getTime());
-                shifted.setDate(shifted.getDate() + 1);
-                new_event = calendar.createAllDayEvent(summary, start, shifted, details);
-            } else {
-                new_event = calendar.createAllDayEvent(summary, start, details);
-            }
-        } else {
-            if (!end || end <= start) end = new Date(start.getTime() + 30 * 60 * 1000);
-            new_event = calendar.createEvent(summary, start, end, details);
-        }
-        new_event_id = new_event.getId().split('@')[0];
+        withRetry('Calendar.Events.insert', function () {
+            return Calendar.Events.insert(resource, calendar_id);
+        });
     } catch (e) {
-        console.error('[+GC] Failed to create event for page %s: %s', page.id, (e && e.message) || e);
-        return false;
+        if (!isConflictError(e)) {
+            console.error('[+GC] Failed to create event for page %s: %s', page.id, (e && e.message) || e);
+            return false;
+        }
+
+        // Created by an earlier attempt (or by a second copy of this script), or
+        // deleted earlier - Google keeps deleted ids reserved. Either way, reuse it.
+        console.log('[+GC] Event %s for page %s already exists in %s. Adopting it instead of creating a copy.', event_id, page.id, calendar_name);
+        try {
+            const revived = Object.assign({}, resource, { status: 'confirmed' });
+            delete revived.id;
+            withRetry('Calendar.Events.patch', function () {
+                return Calendar.Events.patch(revived, calendar_id, event_id);
+            });
+        } catch (e2) {
+            console.error('[+GC] Could not adopt existing event %s for page %s: %s', event_id, page.id, (e2 && e2.message) || e2);
+            return false;
+        }
     }
 
-    if (!new_event_id) {
-        console.log('[+GC] Event "%s" was not created in GCal.', summary);
-        return false;
-    }
-
-    pushDatabaseUpdate(getBaseNotionProperties(target, new_event_id, calendar_name), page.id);
-    return new_event_id;
+    // If this stamp fails the page keeps an empty Event ID. That is no longer
+    // harmful: the next run derives the same id, hits the 409 above and stamps.
+    pushDatabaseUpdate(getBaseNotionProperties(target, event_id, calendar_name), page.id);
+    return event_id;
 }
 
 /**

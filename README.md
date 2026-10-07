@@ -182,6 +182,7 @@ databases.
 | `fullSync()` | Ignores sync tokens and re-reads the whole time window |
 | `resetSyncTokens()` | Deletes all stored sync tokens, forcing a full sync on the next run |
 | `findRecurringLeftovers()` | Lists pages still pointing at an occurrence of a recurring series. Read-only |
+| `findDuplicates()` | Lists duplicate Notion pages and duplicate calendar events, marking orphaned events. Read-only |
 | `tagRecurringLeftovers()` | Tags what the above finds with `Ignore Sync`. **Modifies your database** |
 
 ---
@@ -244,6 +245,7 @@ logged with a reason.
 | `Another sync run is still in progress` | Normal under load. If it appears constantly, the trigger interval is shorter than the actual runtime |
 | Events not appearing in Notion | Check the log — recurring, all-day and out-of-window events are skipped by design |
 | An entry exists in Notion but not on a Notion Calendar view | Notion Calendar shows a database through one specific *view*. That view's filters apply — a view limited to open tasks hides everything already completed |
+| One Notion task shows up twice (or more) in the calendar | Fixed: events are now created with an id derived from the Notion page id, so a page can own only one event per calendar. Existing copies stay until you remove them — run `findDuplicates()`. If it still happens, the script is running twice (another Google account or project with its own trigger) — the locks do not span projects, so disable the old trigger |
 | Old recurring meetings keep reappearing | Pages created before occurrences were filtered still hold an occurrence event id. Run `findRecurringLeftovers()` to list them |
 
 ---
@@ -292,6 +294,15 @@ set grew until each run exceeded the 6-minute limit.
 - Guard every optional Notion property against missing or renamed fields
 - One broken calendar no longer stops the others; errors are collected and
   reported together at the end
+
+### Duplicates
+
+- Create events with a deterministic id (the Notion page id). The original created a
+  fresh event whenever the `Event ID` write-back failed or a second copy of the
+  script ran, so one task became several events — and, coming back through the
+  calendar sync, several pages
+- Re-attach events with such an id to their page instead of creating a new page
+- `findDuplicates()` to find what is already there
 
 ### Features
 
