@@ -10,7 +10,7 @@
  * any later version. See the LICENSE file for the full text.
  *
  * Reliability-hardened version, revision 3 (2026-08-03).
- * Last edited: 2026-10-07 (idempotent event creation, findDuplicates()).
+ * Last edited: 2026-10-09 (retry Google service hiccups at startup, no failure mail for them).
  * See README.md for the full list of changes against the original.
  *
  * Revision 3: multiple Notion databases. Each database ("sync target") owns a
@@ -98,21 +98,56 @@ const CALENDAR_CACHE = {};
 // Entry points
 // ---------------------------------------------------------------------------
 
+/**
+ * Takes the script lock, retrying Google-side hiccups.
+ * @returns {Object|null} the lock, or null if another run holds it (or Google's
+ *     lock service stayed unavailable - logged, and the next trigger tries again)
+ */
+function acquireLock() {
+    try {
+        const lock = withRetry('LockService', function () {
+            const l = LockService.getScriptLock();
+            return l.tryLock(LOCK_WAIT_MS) ? l : null;
+        });
+        if (!lock) console.log('[SYNC] Another sync run is still in progress. Skipping this run.');
+        return lock;
+    } catch (e) {
+        if (!isGoogleOutage(e)) throw e;
+        console.error('[SYNC] Lock service unavailable, skipping this run: %s', errorText(e));
+        return null;
+    }
+}
+
+/** A failing release must not turn a finished run into a failure mail - the lock expires on its own. */
+function releaseLockSafely(lock) {
+    try {
+        lock.releaseLock();
+    } catch (e) {
+        console.error('[SYNC] Could not release the lock (it expires on its own): %s', errorText(e));
+    }
+}
+
 /** Main entry point. Attach your time-driven trigger to this function. */
 function main() {
-    const lock = LockService.getScriptLock();
-
-    if (!lock.tryLock(LOCK_WAIT_MS)) {
-        console.log('[SYNC] Another sync run is still in progress. Skipping this run.');
-        return;
-    }
+    const lock = acquireLock();
+    if (!lock) return;
 
     const errors = [];
 
     try {
         startRunClock();
-        resolveSyncTargets();
-        pruneSyncTokens();
+
+        try {
+            resolveSyncTargets();
+            pruneSyncTokens();
+        } catch (e) {
+            // Google's own services (Properties, Lock, ...) now and then answer
+            // "a server error occurred" even after retries. That is no reason to
+            // send a failure mail - the trigger fires again in a few minutes.
+            if (!isGoogleOutage(e)) throw e;
+            console.error('[SYNC] Google service unavailable during startup, skipping this run: %s', errorText(e));
+            return;
+        }
 
         if (DELETE_CANCELLED_EVENTS) {
             for (const target of TARGETS) {
@@ -162,7 +197,7 @@ function main() {
             }
         }
     } finally {
-        lock.releaseLock();
+        releaseLockSafely(lock);
     }
 
     // Still surface problems (trigger failure mail), but only after everything
@@ -177,11 +212,8 @@ function main() {
  * full sync. Discards all sync tokens and resets the time window around "now".
  */
 function fullSync() {
-    const lock = LockService.getScriptLock();
-    if (!lock.tryLock(LOCK_WAIT_MS)) {
-        console.log('[SYNC] Another sync run is still in progress. Skipping full sync.');
-        return;
-    }
+    const lock = acquireLock();
+    if (!lock) return;
 
     try {
         startRunClock();
@@ -204,7 +236,7 @@ function fullSync() {
             }
         }
     } finally {
-        lock.releaseLock();
+        releaseLockSafely(lock);
     }
 }
 
@@ -423,7 +455,9 @@ function findDuplicates() {
 function resolveSyncTargets() {
     const properties = PropertiesService.getScriptProperties();
 
-    NOTION_TOKEN = properties.getProperty('NOTION_TOKEN');
+    NOTION_TOKEN = withRetry('read NOTION_TOKEN', function () {
+        return properties.getProperty('NOTION_TOKEN');
+    });
     if (!NOTION_TOKEN) throw new Error('Script property "NOTION_TOKEN" is not set.');
 
     let raw_targets;
@@ -527,7 +561,9 @@ function syncTokenKey(calendar_id) {
  */
 function pruneSyncTokens() {
     const properties = PropertiesService.getUserProperties();
-    const all = properties.getProperties();
+    const all = withRetry('read properties', function () {
+        return properties.getProperties();
+    });
 
     const valid = {};
     for (const target of TARGETS) {
@@ -540,7 +576,9 @@ function pruneSyncTokens() {
         if (key.indexOf('syncToken') !== 0) continue;
         if (valid[key]) continue;
 
-        properties.deleteProperty(key);
+        withRetry('delete property', function () {
+            return properties.deleteProperty(key);
+        });
         console.log('[CFG] Removed obsolete sync token "%s".', key);
     }
 }
@@ -568,6 +606,14 @@ function isRetryableError(e) {
     if (e && typeof e.retryable === 'boolean') return e.retryable;
     const msg = String((e && e.message) || e || '');
     return /rate.?limit|too many|quota|timed? ?out|timeout|internal error|Error code INTERNAL|unexpected error|server error occurred|backend error|service unavailable|currently unavailable|temporarily|try again|Address unavailable|Bad Gateway|502|503|504|52\d/i.test(msg);
+}
+
+/**
+ * Google-side outage, as opposed to a quota or configuration problem. Only these
+ * are swallowed at startup - an exhausted daily quota must still raise a mail.
+ */
+function isGoogleOutage(e) {
+    return /server error occurred|backend error|internal error|Error code INTERNAL|service unavailable|currently unavailable|try again/i.test(String((e && e.message) || e || ''));
 }
 
 /** Runs fn, retrying transient failures with exponential backoff + jitter. */
