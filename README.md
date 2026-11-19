@@ -43,7 +43,7 @@ Credit for the original groundwork goes to
 | Skipped | Why |
 | --- | --- |
 | Recurring series and their occurrences | The Notion side has no recurrence model; syncing occurrences produces endless near-duplicates |
-| All-day events coming *from* Google Calendar | Would flood the database with holidays and colleagues' out-of-office entries. All-day events pushed *from* Notion work fine |
+| All-day events coming *from* Google Calendar | Would flood the database with holidays, colleagues' out-of-office entries and a partner's "all day" entries in shared calendars. Timed events that merely look all-day (midnight to midnight) count too. All-day events pushed *from* Notion work fine. Switch: `SYNC_ALL_DAY_FROM_GCAL` |
 | Events outside a sanity window (default −90 / +365 days) | Guards against far-future occurrences leaking in through an incremental sync |
 | Pages tagged `Ignore Sync` | In both directions |
 
@@ -195,9 +195,9 @@ All constants live at the top of `code.gs`.
 
 | Constant | Default | Meaning |
 | --- | --- | --- |
-| `RELATIVE_MIN_DAY` | `7` | Days into the past a *full* sync reads |
+| `RELATIVE_MIN_DAY` | `7` | Days into the past a *full* sync reads. The sync token inherits this window, so older events never arrive, even when edited. To backfill, raise it and run `resetSyncTokens()` + `fullSync()` once |
 | `RELATIVE_MAX_DAY` | `14` | Days into the future a *full* sync reads |
-| `EVENT_WINDOW_PAST_DAYS` | `90` | Hard limit — events starting earlier are never written to Notion |
+| `EVENT_WINDOW_PAST_DAYS` | `365` | Hard limit — events starting earlier are never written to Notion |
 | `EVENT_WINDOW_FUTURE_DAYS` | `365` | Hard limit — events starting later are never written to Notion |
 
 The `EVENT_WINDOW_*` pair is a safety net, not a second sync window.
@@ -213,6 +213,7 @@ Tighten it towards `RELATIVE_*` if you want a stricter net.
 | `DELETE_CANCELLED_EVENTS` | `true` | Delete calendar events for pages tagged `Cancel and Remove` |
 | `IGNORE_RECENTLY_PUSHED` | `true` | Don't let a just-pushed change bounce straight back |
 | `SKIP_BAD_EVENTS` | `true` | Skip malformed events instead of aborting the run |
+| `SYNC_ALL_DAY_FROM_GCAL` | `false` | Write all-day events from Google Calendar to Notion |
 
 ### Reliability
 
@@ -240,6 +241,7 @@ logged with a reason.
 | `Notion token is invalid (401)` | `NOTION_TOKEN` is wrong or was revoked |
 | `Notion object not found (404)` | The database is not shared with the integration |
 | `Notion returned an HTML error page` | A Notion outage. Retried automatically; a single line in the log is normal |
+| `We're sorry, a server error occurred` | Google-side hiccup in a Calendar, Lock or Properties call. Retried automatically; if it persists the run is skipped and the next trigger catches up. Outage errors are logged but do not send a failure mail |
 | `Authorization is required to perform that action` | The trigger's OAuth grant expired or the required scopes changed. Run any function by hand and accept the prompt. If it persists, delete and re-create the trigger |
 | `Calendar … is configured in both …` | The same calendar id appears in two sync targets. Each calendar belongs to exactly one |
 | `Another sync run is still in progress` | Normal under load. If it appears constantly, the trigger interval is shorter than the actual runtime |

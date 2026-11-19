@@ -10,7 +10,7 @@
  * any later version. See the LICENSE file for the full text.
  *
  * Reliability-hardened version, revision 3 (2026-08-03).
- * Last edited: 2026-10-09 (retry Google service hiccups at startup, no failure mail for them).
+ * Last edited: 2026-11-19 (SYNC_ALL_DAY_FROM_GCAL switch, wider past window, no mail for outages).
  * See README.md for the full list of changes against the original.
  *
  * Revision 3: multiple Notion databases. Each database ("sync target") owns a
@@ -56,11 +56,20 @@ const ARCHIVE_CANCELLED_EVENTS = true;
 const DELETE_CANCELLED_EVENTS = true;
 const IGNORE_RECENTLY_PUSHED = true; // Prevents recently modified events from being overwritten by Google Calendar
 const SKIP_BAD_EVENTS = true;
+// All-day events coming FROM Google Calendar (holidays, birthdays, a partner's
+// "all day" entries in a shared calendar). Off by default: they would flood the
+// database. Also covers timed events that merely look all-day (midnight to
+// midnight). All-day pages created in Notion are pushed to the calendar either way.
+const SYNC_ALL_DAY_FROM_GCAL = false;
 
 const CANCELLED_TAG_NAME = 'Cancel and Remove';
 const IGNORE_SYNC_TAG_NAME = 'Ignore Sync';
 
-// Relative to the time of last full sync in days.
+// Relative to the time of last full sync in days. The sync token inherits this
+// window, so events older than RELATIVE_MIN_DAY at the time of the last full
+// sync never arrive - not even when they are edited later. To pull in older
+// events, raise RELATIVE_MIN_DAY (and EVENT_WINDOW_PAST_DAYS) and run
+// resetSyncTokens() + fullSync() once.
 const RELATIVE_MAX_DAY = 14;
 const RELATIVE_MIN_DAY = 7;
 
@@ -69,7 +78,7 @@ const RELATIVE_MIN_DAY = 7;
 // stray far-future occurrence of a colleague's endless recurring series could
 // otherwise land in Notion. Anything starting outside this window is dropped.
 // Tighten these towards RELATIVE_MIN/MAX_DAY if you want a stricter net.
-const EVENT_WINDOW_PAST_DAYS = 90;
+const EVENT_WINDOW_PAST_DAYS = 365;
 const EVENT_WINDOW_FUTURE_DAYS = 365;
 
 // ---------------------------------------------------------------------------
@@ -202,8 +211,16 @@ function main() {
 
     // Still surface problems (trigger failure mail), but only after everything
     // that *could* run has run.
-    if (errors.length > 0) {
-        throw new Error('Sync finished with ' + errors.length + ' error(s):\n- ' + errors.join('\n- '));
+    // Outages on Google's or Notion's side fix themselves by the next run, so
+    // they are logged but do not trigger a failure mail.
+    const real_errors = errors.filter(function (msg) {
+        return !isTransientOutageText(msg);
+    });
+    if (real_errors.length < errors.length) {
+        console.log('[SYNC] %d error(s) caused by a temporary Google/Notion outage - not reported by mail. The next run retries.', errors.length - real_errors.length);
+    }
+    if (real_errors.length > 0) {
+        throw new Error('Sync finished with ' + real_errors.length + ' error(s):\n- ' + real_errors.join('\n- '));
     }
 }
 
@@ -608,6 +625,11 @@ function isRetryableError(e) {
     return /rate.?limit|too many|quota|timed? ?out|timeout|internal error|Error code INTERNAL|unexpected error|server error occurred|backend error|service unavailable|currently unavailable|temporarily|try again|Address unavailable|Bad Gateway|502|503|504|52\d/i.test(msg);
 }
 
+/** True if an error text describes a temporary Google or Notion outage. */
+function isTransientOutageText(text) {
+    return /server error occurred|Notion returned an HTML error page|Notion API error 5\d\d|backend error|service unavailable|currently unavailable/i.test(String(text || ''));
+}
+
 /**
  * Google-side outage, as opposed to a quota or configuration problem. Only these
  * are swallowed at startup - an exhausted daily quota must still raise a mail.
@@ -918,7 +940,7 @@ function parseEvents(target, items, c_name, ignored_eIds) {
             continue;
         }
 
-        if (event.start.date) {
+        if (!SYNC_ALL_DAY_FROM_GCAL && isAllDayEvent(event)) {
             console.log('[+ND] Skipping all-day event %s (%s).', event.id, event.summary);
             continue;
         }
@@ -1376,6 +1398,28 @@ function isEventWithinSaneWindow(event) {
     const day_ms = 24 * 60 * 60 * 1000;
 
     return start.getTime() >= now - EVENT_WINDOW_PAST_DAYS * day_ms && start.getTime() <= now + EVENT_WINDOW_FUTURE_DAYS * day_ms;
+}
+
+/**
+ * True for all-day events, including timed events that only look like one: they
+ * start at midnight (script time zone) and run in whole days, which is how some
+ * clients store "all day" entries.
+ * @param {Object} event Google Calendar event resource
+ * @returns {Boolean}
+ */
+function isAllDayEvent(event) {
+    if (event.start && event.start.date) return true;
+    if (!event.start || !event.start.dateTime || !event.end || !event.end.dateTime) return false;
+
+    const start = new Date(event.start.dateTime);
+    const end = new Date(event.end.dateTime);
+    if (isNaN(start.getTime()) || isNaN(end.getTime())) return false;
+    if (end.getTime() - start.getTime() < 23 * 60 * 60 * 1000) return false;
+
+    const tz = Session.getScriptTimeZone();
+    const start_clock = Utilities.formatDate(start, tz, 'HH:mm');
+    const end_clock = Utilities.formatDate(end, tz, 'HH:mm');
+    return start_clock === '00:00' && (end_clock === '00:00' || end_clock === '23:59');
 }
 
 /**
